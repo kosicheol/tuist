@@ -12,6 +12,7 @@ Application.put_env(:req_llm, :finch,
 
 Mix.install([
   {:req_llm, "~> 1.9"},
+  {:condukt, "~> 0.19"},
   {:yaml_elixir, "~> 2.11"},
   {:expo, "~> 1.1"}
 ])
@@ -512,10 +513,12 @@ defmodule L10n.Translator do
   end
 
   def generate_text_with_retries(resolved_model, messages, timeout, locale, attempt \\ 1) do
-    case ReqLLM.generate_text(resolved_model, messages,
-           max_tokens: 64_000,
-           receive_timeout: timeout
-         ) do
+    opts =
+      resolved_model
+      |> token_limit_option()
+      |> Keyword.put(:receive_timeout, timeout)
+
+    case ReqLLM.generate_text(resolved_model, messages, opts) do
       {:ok, response} ->
         {:ok, response}
 
@@ -566,6 +569,35 @@ defmodule L10n.Translator do
   defp backoff_delay_ms(attempt) do
     @base_retry_delay_ms * Integer.pow(2, attempt - 1)
   end
+
+  defp token_limit_option(resolved_model) do
+    if openai_completion_token_model?(resolved_model) do
+      [max_completion_tokens: 64_000]
+    else
+      [max_tokens: 64_000]
+    end
+  end
+
+  defp openai_completion_token_model?(model) when is_binary(model) do
+    case String.split(model, ":", parts: 2) do
+      ["openai", model_id] -> openai_completion_token_model_id?(model_id)
+      _ -> false
+    end
+  end
+
+  defp openai_completion_token_model?(%{provider: :openai} = model) do
+    model
+    |> Map.get(:id, Map.get(model, :model, ""))
+    |> openai_completion_token_model_id?()
+  end
+
+  defp openai_completion_token_model?(_model), do: false
+
+  defp openai_completion_token_model_id?(model_id) when is_binary(model_id) do
+    String.starts_with?(model_id, ["gpt-4.1", "gpt-5", "o1", "o3", "o4"])
+  end
+
+  defp openai_completion_token_model_id?(_model_id), do: false
 
   @doc """
   Translates a .pot file to all target locales in parallel.
@@ -937,14 +969,27 @@ defmodule L10n.MarkdownTranslator do
   @default_timeout 900_000
 
   @doc """
-  Translates a single markdown document to the given locale.
+  Translates a single markdown document with an agent that can validate its own work.
   """
-  def translate(markdown_content, locale, language, context_body, locale_override, model, timeout) do
+  def translate(
+        markdown_content,
+        locale,
+        language,
+        context_body,
+        locale_override,
+        model,
+        timeout,
+        validation_command,
+        validation_attempts,
+        validation_attrs
+      ) do
     system_prompt = """
     You are a professional translator specializing in technical documentation.
     You translate Tuist documentation markdown from English to #{language} (#{locale}).
 
-    Output ONLY the complete translated markdown file. No markdown fences, no explanation, no preamble.
+    You have a validate_translation tool. Use it to check your complete translated markdown before submitting the final result.
+    If the tool reports a validation error, fix the markdown and call validate_translation again.
+    Only call submit_result after validate_translation returns valid: true for your candidate.
 
     Rules:
     1. Preserve the frontmatter delimiters (`---`) and all frontmatter keys.
@@ -963,104 +1008,41 @@ defmodule L10n.MarkdownTranslator do
     #{if locale_override != "", do: "## Locale-specific instructions for #{language}:\n#{locale_override}", else: ""}
     """
 
-    user_prompt = """
-    Translate the following markdown file to #{language} (#{locale}):
+    validation_attempts = normalize_validation_attempts(validation_attempts)
+    tool = validation_tool(markdown_content, validation_command, validation_attrs)
 
-    #{markdown_content}
-    """
+    result =
+      Condukt.run(
+        """
+        Translate source_markdown to #{language} (#{locale}).
 
-    import ReqLLM.Context
+        Call validate_translation with the full translated markdown candidate before submitting.
+        If validation fails, revise the candidate and call validate_translation again.
+        Make at most #{validation_attempts} validation attempts.
+        When validation passes, submit the final full markdown in the content field.
+        """,
+        model: L10n.Translator.resolve_model(model),
+        system_prompt: system_prompt,
+        input: %{source_markdown: markdown_content},
+        input_schema: markdown_input_schema(),
+        output: markdown_output_schema(),
+        tools: [tool],
+        cwd: validation_attrs.repo_root,
+        thinking_level: nil,
+        timeout: timeout,
+        max_turns: validation_attempts + 2,
+        load_project_instructions: false
+      )
 
-    messages = [
-      system(system_prompt),
-      user(user_prompt)
-    ]
+    case result do
+      {:ok, %{content: translated_content}} ->
+        finalize_translation(markdown_content, translated_content, validation_command, validation_attrs)
 
-    resolved_model = L10n.Translator.resolve_model(model)
-
-    case L10n.Translator.generate_text_with_retries(resolved_model, messages, timeout, locale) do
-      {:ok, response} ->
-        text =
-          response
-          |> ReqLLM.Response.text()
-          |> String.trim()
-          |> String.replace(~r/^```[a-zA-Z0-9_-]*\n/, "")
-          |> String.replace(~r/\n```$/, "")
-          |> String.trim()
-
-        {:ok, text}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @doc """
-  Repairs a translated markdown document using validation feedback.
-  """
-  def repair(
-        source_content,
-        translated_content,
-        validation_error,
-        locale,
-        language,
-        context_body,
-        locale_override,
-        model,
-        timeout
-      ) do
-    system_prompt = """
-    You are repairing a translated Tuist documentation markdown file for #{language} (#{locale}).
-
-    Output ONLY the complete corrected markdown file. No markdown fences, no explanation, no preamble.
-
-    Keep the translation in #{language}. Fix only the issues identified by validation while preserving the source document structure:
-    - Preserve frontmatter delimiters and keys.
-    - Preserve heading IDs, URLs, paths, inline code spans, fenced code blocks, component tags, HTML tags, HEEx expressions, and GitHub alert markers exactly.
-    - Preserve the translated prose unless changing it is necessary to satisfy validation.
-    - Do not use em dashes.
-
-    #{context_body}
-
-    #{if locale_override != "", do: "## Locale-specific instructions for #{language}:\n#{locale_override}", else: ""}
-    """
-
-    user_prompt = """
-    The translated markdown failed validation.
-
-    Validation error:
-    #{validation_error}
-
-    English source markdown:
-    #{source_content}
-
-    Current translated markdown:
-    #{translated_content}
-    """
-
-    import ReqLLM.Context
-
-    messages = [
-      system(system_prompt),
-      user(user_prompt)
-    ]
-
-    resolved_model = L10n.Translator.resolve_model(model)
-
-    case L10n.Translator.generate_text_with_retries(resolved_model, messages, timeout, locale) do
-      {:ok, response} ->
-        text =
-          response
-          |> ReqLLM.Response.text()
-          |> String.trim()
-          |> String.replace(~r/^```[a-zA-Z0-9_-]*\n/, "")
-          |> String.replace(~r/\n```$/, "")
-          |> String.trim()
-
-        {:ok, text}
+      {:ok, %{"content" => translated_content}} ->
+        finalize_translation(markdown_content, translated_content, validation_command, validation_attrs)
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, format_error(reason)}
     end
   end
 
@@ -1117,17 +1099,6 @@ defmodule L10n.MarkdownTranslator do
             with {:ok, translated_content} <-
                    translate(
                      markdown_content,
-                     locale,
-                     language,
-                     context_body,
-                     locale_override,
-                     model,
-                     request_timeout
-                   ),
-                 {:ok, translated_content} <-
-                   validate_or_repair(
-                     markdown_content,
-                     translated_content,
                      locale,
                      language,
                      context_body,
@@ -1190,61 +1161,88 @@ defmodule L10n.MarkdownTranslator do
     end
   end
 
-  defp validate_or_repair(
-         source_content,
-         translated_content,
-         locale,
-         language,
-         context_body,
-         locale_override,
-         model,
-         timeout,
-         validation_command,
-         max_attempts,
-         validation_attrs,
-         attempt \\ 1
-       ) do
-    case validate_candidate(source_content, translated_content, validation_command, validation_attrs) do
-      :ok ->
-        {:ok, translated_content}
+  defp markdown_input_schema do
+    %{
+      type: "object",
+      properties: %{
+        source_markdown: %{type: "string"}
+      },
+      required: ["source_markdown"],
+      additionalProperties: false
+    }
+  end
 
-      {:error, reason} when attempt < max_attempts ->
-        IO.puts(
-          "    #{locale}: validation failed, asking the model to repair it (attempt #{attempt + 1}/#{max_attempts})"
-        )
+  defp markdown_output_schema do
+    %{
+      type: "object",
+      properties: %{
+        content: %{type: "string"}
+      },
+      required: ["content"],
+      additionalProperties: false
+    }
+  end
 
-        with {:ok, repaired_content} <-
-               repair(
-                 source_content,
-                 translated_content,
-                 reason,
-                 locale,
-                 language,
-                 context_body,
-                 locale_override,
-                 model,
-                 timeout
-               ) do
-          validate_or_repair(
-            source_content,
-            repaired_content,
-            locale,
-            language,
-            context_body,
-            locale_override,
-            model,
-            timeout,
-            validation_command,
-            max_attempts,
-            validation_attrs,
-            attempt + 1
-          )
+  defp validation_tool(source_content, validation_command, validation_attrs) do
+    Condukt.tool(
+      name: "validate_translation",
+      description: "Validates a full translated Tuist documentation markdown candidate.",
+      parameters: %{
+        type: "object",
+        properties: %{
+          content: %{
+            type: "string",
+            description: "The complete translated markdown file to validate."
+          }
+        },
+        required: ["content"],
+        additionalProperties: false
+      },
+      call: fn %{"content" => content}, _context ->
+        content = strip_markdown_fence(content) |> String.trim()
+
+        case validate_candidate(source_content, content, validation_command, validation_attrs) do
+          :ok ->
+            {:ok, %{valid: true, message: "Translation validated successfully."}}
+
+          {:error, reason} ->
+            {:ok, %{valid: false, message: reason}}
         end
+      end
+    )
+  end
 
-      {:error, reason} ->
-        {:error, reason}
+  defp finalize_translation(source_content, translated_content, validation_command, validation_attrs) do
+    translated_content =
+      translated_content
+      |> strip_markdown_fence()
+      |> String.trim()
+
+    with :ok <- validate_candidate(source_content, translated_content, validation_command, validation_attrs) do
+      {:ok, translated_content}
     end
   end
+
+  defp normalize_validation_attempts(attempts) when is_integer(attempts), do: max(attempts, 1)
+
+  defp normalize_validation_attempts(attempts) when is_binary(attempts) do
+    case Integer.parse(attempts) do
+      {integer, ""} -> normalize_validation_attempts(integer)
+      _ -> 1
+    end
+  end
+
+  defp normalize_validation_attempts(_attempts), do: 1
+
+  defp strip_markdown_fence(content) do
+    content
+    |> String.trim()
+    |> String.replace(~r/^```[a-zA-Z0-9_-]*\n/, "")
+    |> String.replace(~r/\n```$/, "")
+  end
+
+  defp format_error(reason) when is_binary(reason), do: reason
+  defp format_error(reason), do: inspect(reason)
 
   defp validate_candidate(source_content, translated_content, validation_command, validation_attrs) do
     output_path = validation_attrs.output_path
@@ -1305,6 +1303,7 @@ defmodule L10n.CLI do
     * `--force`, `-f` — Re-translate all files, ignoring lock state
     * `--locale`, `-l` — Translate only the specified locale (e.g., `--locale es`)
     * `--model`, `-m` — Override the LLM model from L10N.md (e.g., `--model openai:gpt-4.1`)
+    * `--l10n-dir` — Translate only the given directory's L10N.md (e.g., `server/priv/docs`)
     * `--concurrency`, `-c` — Max parallel translations per locale within one source file (default: 7)
     * `--pot-concurrency` — Max parallel source files being translated at once (default: 4)
     * `--timeout`, `-t` — Timeout in ms per translation request (default: 900000)
@@ -1321,7 +1320,10 @@ defmodule L10n.CLI do
 
     IO.puts("Scanning for L10N.md files...")
 
-    l10n_files = find_l10n_files_with_sources(repo_root)
+    l10n_files =
+      repo_root
+      |> find_l10n_files_with_sources()
+      |> filter_l10n_dirs(Keyword.get(opts, :l10n_dir), repo_root)
 
     if Enum.empty?(l10n_files) do
       IO.puts("No L10N.md files with sources found.")
@@ -1450,6 +1452,7 @@ defmodule L10n.CLI do
           force: :boolean,
           locale: :string,
           model: :string,
+          l10n_dir: :string,
           concurrency: :integer,
           pot_concurrency: :integer,
           timeout: :integer
@@ -1458,6 +1461,16 @@ defmodule L10n.CLI do
       )
 
     {opts, rest}
+  end
+
+  defp filter_l10n_dirs(l10n_dirs, nil, _repo_root), do: l10n_dirs
+
+  defp filter_l10n_dirs(l10n_dirs, l10n_dir, repo_root) do
+    expected_dir = Path.expand(l10n_dir, repo_root)
+
+    Enum.filter(l10n_dirs, fn dir ->
+      Path.expand(dir) == expected_dir
+    end)
   end
 
   defp find_repo_root do
