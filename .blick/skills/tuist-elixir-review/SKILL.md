@@ -1,6 +1,6 @@
 ---
 name: tuist-elixir-review
-description: Project-specific PR-review rules for the tuist/tuist Elixir codebases (server, cache, processor, xcode_processor, tuist_common, noora). Focuses on the things only this repo knows — authorization invariants, tenancy, write-only ClickHouse, Mimic placement, migration timestamptz, data-export updates, and i18n.
+description: Project-specific PR-review rules for the tuist/tuist Elixir codebases (server, cache, processor, xcode_processor, tuist_common, noora). Focuses on the things only this repo knows — authorization invariants, tenancy, write-only ClickHouse, Mimic placement, migration timestamptz, data-export updates, i18n, controller error handling, and SCIM security.
 ---
 
 # Tuist Elixir Review
@@ -247,6 +247,10 @@ then bare `Repo.*` inside the loop).
 - Per-element inserts/updates/deletes that have an `_all` equivalent
   (`insert_all`, `update_all`, `delete_all`).
 
+**Verify the data source is actually a database query.** If the
+iteration is over an in-memory map, list, or pre-loaded data structure
+(not a `Repo` call), this is not an N+1 — do not flag it.
+
 When suggesting a fix, **name the consolidating primitive** so the
 author can act on it directly:
 
@@ -270,6 +274,9 @@ author can act on it directly:
   the cursor-based stream (e.g. "stream so we don't load 10M rows").
 - Pre-existing N+1s untouched by the diff — this skill is for new
   regressions, not codebase-wide audits.
+- **In-memory map lookups.** When data is pre-loaded via a single
+  batched query (e.g., `where: id in ^ids_chunk`) and stored in a
+  map for iteration, `Map.get/2` calls inside `Enum.map` are not N+1s.
 
 ---
 
@@ -312,6 +319,81 @@ When suggesting a fix:
 
 ---
 
+## 11. Controller error handling — MatchError to HTTP 500
+
+Phoenix controllers must handle error tuples gracefully rather than
+using strict pattern matching that crashes with `MatchError` (which
+becomes HTTP 500).
+
+### Flag (Severity: medium; high for user-facing endpoints)
+
+- **Strict pattern matching on `{:ok, _}` without a corresponding
+  `{:error, _}` clause** in a Phoenix controller action, where the
+  underlying function can return an error tuple. This crashes with
+  `MatchError` instead of returning a proper HTTP error response.
+
+Example anti-pattern:
+```elixir
+{:ok, test_case} = Tests.update_test_case(id, attrs)
+render(conn, :show, test_case: test_case)
+```
+
+Correct pattern:
+```elixir
+case Tests.update_test_case(id, attrs) do
+  {:ok, test_case} -> render(conn, :show, test_case: test_case)
+  {:error, :not_found} -> send_resp(conn, 404, "")
+  {:error, changeset} -> render(conn, :error, changeset: changeset)
+end
+```
+
+### Do not flag
+
+- Internal/private endpoints where crashing is acceptable.
+- Calls that genuinely cannot fail (e.g., pure data transformation).
+- Existing strict pattern matches unchanged by the diff.
+
+---
+
+## 12. SCIM Security — tenant-aware user operations
+
+SCIM (System for Cross-domain Identity Management) endpoints handle
+user and group provisioning across organizations. These endpoints are
+high-risk for cross-tenant data leaks and privilege escalation.
+
+### Flag (Severity: critical)
+
+- **Global user lookups without tenant scoping** in SCIM operations.
+  Functions like `Accounts.get_user_by_id/1` (global) should not be used
+  for SCIM; prefer `get_user/2` scoped to the organization.
+- **User deactivation that sets a global flag** instead of removing
+  the user from the specific organization. Setting `users.active = false`
+  globally locks the user out of *every* organization; SCIM deprovisioning
+  should only remove the org membership.
+- **Adding users to organizations without verifying org membership first.**
+  An attacker could add any user to their organization, then deactivate
+  them globally.
+- **Missing transaction boundaries** when multiple related DB operations
+  occur (user creation + org membership + role assignment). Should use
+  `Ecto.Multi` or `Repo.transaction`.
+- **Token authentication that allows format bypass** — e.g., stripping
+  a prefix (`scim_`) and forwarding to generic token lookup, allowing
+  the same credential to authenticate against two different token types.
+- **Unvalidated `X-Forwarded-*` headers** in SCIM controllers. These can
+  be injected by clients to redirect IdP follow-up requests to attacker
+  hosts.
+- **Missing rate limiting** on SCIM endpoints. Authenticated endpoints
+  should have rate-limit plugs to prevent enumeration and DoS.
+
+### Do not flag
+
+- SCIM endpoints that already have proper tenant scoping, transaction
+  boundaries, and rate limiting.
+- Read-only SCIM operations (e.g., `GET /Users`) where the underlying
+  query is already scoped by organization.
+
+---
+
 ## Out of scope (handled elsewhere — do not flag)
 
 - Module / function naming, pipe-chain start, function ordering,
@@ -327,7 +409,7 @@ When suggesting a fix:
 For each finding, confirm:
 
 1. The `path:line` is real and the snippet appears in the diff.
-2. The category above is one of 1–10; if it isn't, downgrade to a
+2. The category above is one of 1–12; if it isn't, downgrade to a
    question (`uncertain: ...`) rather than asserting a finding.
 3. The severity is set: **critical** (auth bypass / cross-tenant read or
    write), **high** (likely security or correctness bug), **medium**

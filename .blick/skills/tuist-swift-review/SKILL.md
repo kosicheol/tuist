@@ -33,31 +33,29 @@ semantics, identity, inheritance, or `deinit` are actually required.
 - Types that genuinely need reference identity (caches, long-lived
   coordinators, actors-with-state-shared-by-reference).
 
-## 2. Testing framework — Swift Testing, not XCTest
+## 2. Testing framework — Swift Testing for new tests
 
 New tests must be written with **Swift Testing** (`import Testing`,
 `@Test`, `#expect`, `#require`). XCTest is legacy in this repo.
 
-When a diff **modifies** an existing XCTest case (i.e. the test file
-already uses `XCTestCase` / `func testXxx()` and the PR changes one of
-those tests), the test should be **rewritten in Swift Testing as part of
-the same change** rather than patched in place. Touching a test is the
-moment to migrate it.
-
 ### Flag
 
-- **A newly added test file or test function that uses `XCTestCase` /
+- **A newly added test file that uses `XCTestCase` /
   `XCTAssert*` / `func testXxx()`.** Recommend Swift Testing.
   **Severity: high.**
-- **A modified XCTest test that was edited but not migrated to Swift
-  Testing.** Ask the author to rewrite the touched test(s) using
-  `@Test` / `#expect` / `#require`. **Severity: medium.**
+- **A newly added test function in an existing XCTest file that uses
+  `func testXxx()` instead of `@Test`.** Recommend Swift Testing.
+  **Severity: medium.**
 - **Mixing `XCTAssert*` calls inside a Swift Testing `@Test`** (or vice
   versa). Pick one framework per test.
 
 ### Do not flag
 
 - Pre-existing XCTest tests that the diff does not touch.
+- Modifications to existing XCTest tests (e.g., changing an assertion
+  value, adding a test case to an existing XCTest class). The convention
+  is to use Swift Testing for new tests, not to migrate existing test
+  files when making minor changes.
 - XCTest-only APIs that have no Swift Testing equivalent yet (e.g.
   `XCUITest` UI automation) — leave those on XCTest.
 - Test helpers/fixtures that aren't themselves test cases.
