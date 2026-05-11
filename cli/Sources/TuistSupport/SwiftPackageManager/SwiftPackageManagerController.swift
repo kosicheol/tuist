@@ -66,20 +66,24 @@ public protocol SwiftPackageManagerControlling {
 public struct SwiftPackageManagerController: SwiftPackageManagerControlling {
     private let fileSystem: FileSysteming
     private let commandRunner: () -> CommandRunning
+    private let swiftPackageManagerLock: SwiftPackageManagerLock
 
     public init() {
         self.init(
             fileSystem: FileSystem(),
-            commandRunner: { CommandRunner(logger: Logger.current) }
+            commandRunner: { CommandRunner(logger: Logger.current) },
+            swiftPackageManagerLock: SwiftPackageManagerLock()
         )
     }
 
     init(
         fileSystem: FileSysteming,
-        commandRunner: @escaping () -> CommandRunning
+        commandRunner: @escaping () -> CommandRunning,
+        swiftPackageManagerLock: SwiftPackageManagerLock = SwiftPackageManagerLock()
     ) {
         self.fileSystem = fileSystem
         self.commandRunner = commandRunner
+        self.swiftPackageManagerLock = swiftPackageManagerLock
     }
 
     public func resolve(at path: AbsolutePath, arguments: [String], printOutput: Bool) async throws {
@@ -88,9 +92,11 @@ public struct SwiftPackageManagerController: SwiftPackageManagerControlling {
             extraArguments: arguments + ["resolve"]
         )
 
-        printOutput ?
-            try await commandRunner().runAndPrint(arguments: command) :
-            try await commandRunner().runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            printOutput ?
+                try await commandRunner().runAndPrint(arguments: command) :
+                try await commandRunner().runAndWait(arguments: command)
+        }
     }
 
     public func update(at path: AbsolutePath, arguments: [String], printOutput: Bool) async throws {
@@ -99,9 +105,11 @@ public struct SwiftPackageManagerController: SwiftPackageManagerControlling {
             extraArguments: arguments + ["update"]
         )
 
-        printOutput ?
-            try await commandRunner().runAndPrint(arguments: command) :
-            try await commandRunner().runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            printOutput ?
+                try await commandRunner().runAndPrint(arguments: command) :
+                try await commandRunner().runAndWait(arguments: command)
+        }
     }
 
     public func setToolsVersion(at path: AbsolutePath, to version: Version) async throws {
@@ -109,7 +117,9 @@ public struct SwiftPackageManagerController: SwiftPackageManagerControlling {
 
         let command = buildSwiftPackageCommand(packagePath: path, extraArguments: extraArguments)
 
-        try await commandRunner().runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            try await commandRunner().runAndWait(arguments: command)
+        }
     }
 
     public func getToolsVersion(at path: AbsolutePath) async throws -> Version {
@@ -139,18 +149,20 @@ public struct SwiftPackageManagerController: SwiftPackageManagerControlling {
 
         let arm64Target = "arm64-apple-macosx"
         let x64Target = "x86_64-apple-macosx"
-        try await commandRunner().runAndWait(
-            arguments:
-            buildCommand + [
-                arm64Target,
-            ]
-        )
-        try await commandRunner().runAndWait(
-            arguments:
-            buildCommand + [
-                x64Target,
-            ]
-        )
+        try await swiftPackageManagerLock.withLock(packagePath: packagePath) {
+            try await commandRunner().runAndWait(
+                arguments:
+                buildCommand + [
+                    arm64Target,
+                ]
+            )
+            try await commandRunner().runAndWait(
+                arguments:
+                buildCommand + [
+                    x64Target,
+                ]
+            )
+        }
 
         if try await !fileSystem.exists(outputPath) {
             try await fileSystem.makeDirectory(at: outputPath)

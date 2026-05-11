@@ -19,29 +19,36 @@ public protocol PackageInfoLoading {
 public struct PackageInfoLoader: PackageInfoLoading {
     private let commandRunner: CommandRunning
     private let fileSystem: FileSysteming
+    private let swiftPackageManagerLock: SwiftPackageManagerLock
 
     public init(
         commandRunner: CommandRunning = CommandRunner(),
-        fileSystem: FileSysteming = FileSystem()
+        fileSystem: FileSysteming = FileSystem(),
+        swiftPackageManagerLock: SwiftPackageManagerLock = SwiftPackageManagerLock()
     ) {
         self.commandRunner = commandRunner
         self.fileSystem = fileSystem
+        self.swiftPackageManagerLock = swiftPackageManagerLock
     }
 
     public func resolve(at path: AbsolutePath, printOutput: Bool) async throws {
         let command = buildSwiftPackageCommand(packagePath: path, extraArguments: ["resolve"])
 
-        printOutput ?
-            try await commandRunner.runAndPrint(arguments: command) :
-            try await commandRunner.runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            printOutput ?
+                try await commandRunner.runAndPrint(arguments: command) :
+                try await commandRunner.runAndWait(arguments: command)
+        }
     }
 
     public func update(at path: AbsolutePath, printOutput: Bool) async throws {
         let command = buildSwiftPackageCommand(packagePath: path, extraArguments: ["update"])
 
-        printOutput ?
-            try await commandRunner.runAndPrint(arguments: command) :
-            try await commandRunner.runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            printOutput ?
+                try await commandRunner.runAndPrint(arguments: command) :
+                try await commandRunner.runAndWait(arguments: command)
+        }
     }
 
     public func setToolsVersion(at path: AbsolutePath, to version: TSCUtility.Version) async throws {
@@ -49,7 +56,9 @@ public struct PackageInfoLoader: PackageInfoLoading {
 
         let command = buildSwiftPackageCommand(packagePath: path, extraArguments: extraArguments)
 
-        try await commandRunner.runAndWait(arguments: command)
+        try await swiftPackageManagerLock.withLock(packagePath: path) {
+            try await commandRunner.runAndWait(arguments: command)
+        }
     }
 
     public func getToolsVersion(at path: AbsolutePath) async throws -> TSCUtility.Version {
@@ -68,7 +77,9 @@ public struct PackageInfoLoader: PackageInfoLoading {
         }
         let command = buildSwiftPackageCommand(packagePath: path, extraArguments: extraArguments)
 
-        let json = try await commandRunner.capture(arguments: command)
+        let json = try await swiftPackageManagerLock.withLock(packagePath: path) {
+            try await commandRunner.capture(arguments: command)
+        }
 
         let data = Data(json.utf8)
         let decoder = JSONDecoder()
@@ -94,18 +105,20 @@ public struct PackageInfoLoader: PackageInfoLoading {
 
         let arm64Target = "arm64-apple-macosx"
         let x64Target = "x86_64-apple-macosx"
-        try await commandRunner.runAndWait(
-            arguments:
-            buildCommand + [
-                arm64Target,
-            ]
-        )
-        try await commandRunner.runAndWait(
-            arguments:
-            buildCommand + [
-                x64Target,
-            ]
-        )
+        try await swiftPackageManagerLock.withLock(packagePath: packagePath) {
+            try await commandRunner.runAndWait(
+                arguments:
+                buildCommand + [
+                    arm64Target,
+                ]
+            )
+            try await commandRunner.runAndWait(
+                arguments:
+                buildCommand + [
+                    x64Target,
+                ]
+            )
+        }
 
         if try await !fileSystem.exists(outputPath) {
             try await fileSystem.makeDirectory(at: outputPath)
